@@ -2,12 +2,13 @@ mod gui;
 mod gui_example;
 
 use std::iter;
+use std::time::{Duration, Instant};
 
+use cgmath::num_traits::Pow;
 use egui_wgpu::renderer::ScreenDescriptor;
 use gui::EguiRenderer;
-use gui_example::GUI;
-use wgpu::util::DeviceExt;
-use wgpu::TextureViewDescriptor;
+use wgpu::{util::DeviceExt, BindGroupLayoutDescriptor};
+use wgpu::{BindGroupLayoutEntry, TextureViewDescriptor};
 use winit::{
     event::*,
     event_loop::EventLoop,
@@ -15,8 +16,9 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
+const SIZE: u32 = 2048;
+const CELLS: u32 = SIZE;
+const WINDOW_SIZE: u32 = 2048;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -48,20 +50,71 @@ impl Vertex {
 
 const VERTICES: &[Vertex] = &[
     Vertex {
-        position: [0.0, 0.5, 0.0],
+        position: [-1.0, -1.0, 0.0],
         color: [1.0, 0.0, 0.0],
     },
     Vertex {
-        position: [-0.5, -0.5, 0.0],
+        position: [1.0, -1.0, 0.0],
         color: [0.0, 1.0, 0.0],
     },
     Vertex {
-        position: [0.5, -0.5, 0.0],
+        position: [1.0, 1.0, 0.0],
+        color: [0.0, 0.0, 1.0],
+    },
+    Vertex {
+        position: [-1.0, 1.0, 0.0],
         color: [0.0, 0.0, 1.0],
     },
 ];
+const INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
 
-const INDICES: &[u16] = &[0, 1, 2];
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    model: [f32; 4],
+}
+
+#[derive(Debug)]
+struct Instance {
+    position: [f32; 4],
+}
+
+impl Instance {
+    fn to_raw(&self) -> InstanceRaw {
+        InstanceRaw {
+            model: self.position,
+        }
+    }
+}
+
+impl InstanceRaw {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+            // We need to switch from using a step mode of Vertex to Instance
+            // This means that our shaders will only change to use the next
+            // instance when the shader starts processing a new instance
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
+                // for each vec4. We'll have to reassemble the mat4 in the shader.
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Params {
+    window_size: u32,
+    cells: u32,
+}
 
 struct State {
     surface: wgpu::Surface,
@@ -71,11 +124,21 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     // NEW!
-    vertex_buffer: wgpu::Buffer,
+    vertex_buffer0: wgpu::Buffer,
+    vertex_buffer1: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
     window: Window,
     egui: gui::EguiRenderer,
+    instances: Vec<Instance>,
+    uniform_bind_group: wgpu::BindGroup,
+    toggle: u8,
+
+    square_buffer: wgpu::Buffer,
+
+    compute_pipeline: wgpu::ComputePipeline,
+    bind_group0: wgpu::BindGroup,
+    bind_group1: wgpu::BindGroup,
 }
 
 impl State {
@@ -108,7 +171,7 @@ impl State {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
-                    features: wgpu::Features::empty(),
+                    features: wgpu::Features::POLYGON_MODE_LINE,
                     // WebGL doesn't support all of wgpu's features, so if
                     // we're building for the web we'll have to disable some.
                     limits: if cfg!(target_arch = "wasm32") {
@@ -148,10 +211,180 @@ impl State {
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
+        });
+
+        // UNIFORM -------------
+        let uniform = Params {
+            window_size: WINDOW_SIZE,
+            cells: CELLS,
+        };
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let uniform_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Uniform BGL"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Uniform BG"),
+            layout: &uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        // BUFFERS FOR COMPUTE AND RENDER --------------
+
+        let instances = (0..SIZE)
+            .flat_map(|y| {
+                (0..SIZE).map(move |x| Instance {
+                    position: [
+                        x as f32,
+                        y as f32,
+                        0.0,
+                        if y == x || x == (SIZE - y) { 1.0 } else { 0.0 },
+                    ],
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+
+        let square_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Square Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let vertex_buffer0 = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Instance Buffer"),
+            contents: bytemuck::cast_slice(&instance_data),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+        });
+        let vertex_buffer1 = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Instance Buffer"),
+            contents: bytemuck::cast_slice(&instance_data),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+        });
+
+        let compute_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("compute BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let compute_bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Uniform BG"),
+            layout: &compute_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: vertex_buffer0.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: vertex_buffer1.as_entire_binding(),
+                },
+            ],
+        });
+
+        let compute_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Uniform BG"),
+            layout: &compute_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: vertex_buffer1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: vertex_buffer0.as_entire_binding(),
+                },
+            ],
+        });
+
+        let compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[&compute_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Compute Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: "cs_main",
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let num_indices = INDICES.len() as u32;
+
+        // RENDER PIPELINE ---------------------
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&uniform_layout],
                 push_constant_ranges: &[],
             });
 
@@ -161,7 +394,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::desc()],
+                buffers: &[Vertex::desc(), InstanceRaw::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -199,18 +432,6 @@ impl State {
             multiview: None,
         });
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let num_indices = INDICES.len() as u32;
-
         // ...
         let mut egui = EguiRenderer::new(
             &device,       // wgpu Device
@@ -227,11 +448,19 @@ impl State {
             config,
             size,
             render_pipeline,
-            vertex_buffer,
+            vertex_buffer0,
+            vertex_buffer1,
             index_buffer,
             num_indices,
             window,
             egui,
+            instances,
+            uniform_bind_group,
+            toggle: 0,
+            compute_pipeline,
+            bind_group0: compute_bg0,
+            bind_group1: compute_bg1,
+            square_buffer,
         }
     }
 
@@ -276,6 +505,25 @@ impl State {
             });
 
         {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&self.compute_pipeline);
+            compute_pass.set_bind_group(
+                0,
+                if self.toggle == 1 {
+                    &self.bind_group0
+                } else {
+                    &self.bind_group1
+                },
+                &[],
+            );
+            compute_pass.dispatch_workgroups(CELLS / 4, CELLS / 4, 1);
+        }
+
+        {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -297,9 +545,19 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.square_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            render_pass.set_vertex_buffer(
+                1,
+                if self.toggle == 1 {
+                    self.vertex_buffer0.slice(..)
+                } else {
+                    self.vertex_buffer1.slice(..)
+                },
+            );
+
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..self.instances.len() as _);
         }
 
         let screen_descriptor = ScreenDescriptor {
@@ -307,18 +565,23 @@ impl State {
             pixels_per_point: self.window().scale_factor() as f32,
         };
 
-        self.egui.draw(
-            &self.device,
-            &self.queue,
-            &mut encoder,
-            &self.window,
-            &view,
-            screen_descriptor,
-            |ui| GUI(ui),
-        );
+        // self.egui.draw(
+        //     &self.device,
+        //     &self.queue,
+        //     &mut encoder,
+        //     &self.window,
+        //     &view,
+        //     screen_descriptor,
+        //     |ui| GUI(ui),
+        // );
 
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
+
+        self.toggle = 1 - self.toggle;
+        // println!("{0}", self.toggle);
+
+        // self.window().request_redraw();
 
         Ok(())
     }
@@ -336,29 +599,18 @@ pub async fn run() {
     }
 
     let event_loop = EventLoop::new().unwrap();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        // Winit prevents sizing with CSS, so we have to set
-        // the size manually when on web.
-        use winit::dpi::PhysicalSize;
-        window.set_inner_size(PhysicalSize::new(450, 400));
-
-        use winit::platform::web::WindowExtWebSys;
-        web_sys::window()
-            .and_then(|win| win.document())
-            .and_then(|doc| {
-                let dst = doc.get_element_by_id("wasm-example")?;
-                let canvas = web_sys::Element::from(window.canvas());
-                dst.append_child(&canvas).ok()?;
-                Some(())
-            })
-            .expect("Couldn't append canvas to document body.");
-    }
+    let window = WindowBuilder::new()
+        .with_inner_size(winit::dpi::PhysicalSize {
+            width: WINDOW_SIZE,
+            height: WINDOW_SIZE,
+        })
+        .build(&event_loop)
+        .unwrap();
 
     // State::new uses async code, so we're going to wait for it to finish
     let mut state = State::new(window).await;
+    let start_time = Instant::now();
+    let frame_duration = Duration::from_secs_f64(1.0 / 10.0);
 
     let _ = event_loop.run(move |event, ewlt| match event {
         Event::WindowEvent {
@@ -379,6 +631,18 @@ pub async fn run() {
                     WindowEvent::Resized(physical_size) => {
                         state.resize(*physical_size);
                     }
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                logical_key: Key::Named(NamedKey::Space),
+                                state: press,
+                                ..
+                            },
+                        ..
+                    } if press == &ElementState::Pressed => {
+                        // state.toggle = 1 - state.toggle;
+                        state.window().request_redraw();
+                    }
                     WindowEvent::RedrawRequested => {
                         state.update();
 
@@ -393,6 +657,17 @@ pub async fn run() {
                             // We're ignoring timeouts
                             Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
                         }
+
+                        // let elapsed_time = start_time.elapsed();
+                        // if elapsed_time >= frame_duration {
+                        //     // Perform rendering here
+
+                        //     // Update start_time to the current time
+                        //     start_time = Instant::now();
+
+                        //     // Request redraw
+                        //     window.request_redraw();
+                        // }
                     }
 
                     _ => {}

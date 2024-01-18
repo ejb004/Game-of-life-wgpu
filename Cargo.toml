@@ -19,5 +19,7 @@ cfg-if = "1.0.0"
 log = "0.4.20"
 egui-winit = "0.25.0"
 egui = "0.25.0"
+cgmath = "0.18.0"
+rand = "0.8.5"
 [profile.dev]
 opt-level = 1
